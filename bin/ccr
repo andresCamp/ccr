@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""ccr — Claude Code Resume.
+
+A CRUD-clean session registry over Claude Code's per-cwd JSONL files, keyed
+on Ghostty's stable surface UUIDs (which survive crash + window-save-state).
+
+CRUD lifecycle:
+    Create  — `claude` start fires SessionStart hook → writes binding
+    Read    — `ccr ls`, `ccr` (this tab), `ccr pick`, `ccr state`
+    Update  — `ccr adopt` (retroactively bind), session-start re-overwrites
+    Delete  — automatic on TAB CLOSE (lazy: at every mutating ccr command,
+              prunes bindings whose surface UUID isn't a live Ghostty tab).
+              Also: `ccr unbind` (this tab), `ccr clear` (bindings whose
+              session JSONL has been deleted).
+              Bindings persist when the Claude session ends but the tab
+              stays open — type `ccr` to resume the same session in place.
+
+Usage:
+    ccr                  # resume the session bound to this tab
+    ccr help             # list all commands
+    ccr state            # full registry + Ghostty live-state table
+    ccr ls               # compact list of bindings
+    ccr ls .             # bindings for current cwd only
+    ccr pick             # fzf picker over sessions in current cwd
+    ccr adopt            # bind current tab → most recent session in cwd
+    ccr restore-all      # bulk recovery: resume all bound sessions in their tabs
+    ccr <uuid|prefix>    # resume a specific session id (must be unambiguous)
+    ccr unbind           # remove this tab's binding
+    ccr clear            # remove bindings whose session JSONL has been deleted
+    ccr --version        # print version
+"""
+
+from __future__ import annotations
+
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+if sys.version_info < (3, 10):
+    sys.stderr.write(
+        "ccr: requires Python 3.10 or newer (you have "
+        f"{sys.version_info.major}.{sys.version_info.minor}). "
+        "Try `brew install python@3.12`.\n"
+    )
+    sys.exit(2)
+
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CCR_DIR = Path(os.environ.get("CCR_DIR", str(Path.home() / ".ccr")))
+REGISTRY = CCR_DIR / "registry.json"
+LOCKFILE = CCR_DIR / "registry.lock"
+OSASCRIPT_TIMEOUT = 15.0
+
+
+# ─── Registry ──────────────────────────────────────────────────────────────
+
+@contextmanager
+def _registry_lock():
+    """Exclusive flock on the registry, shared with session-start.sh's bash flock."""
+    CCR_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CCR_DIR, 0o700)
+    except OSError:
+        pass
+    f = open(LOCKFILE, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()
+
+
+def _read_registry_unlocked() -> dict:
+    if not REGISTRY.exists():
+        return {}
+    try:
+        return json.loads(REGISTRY.read_text())
+    except (OSError, json.JSONDecodeError):
+        # Quarantine the corrupt file so the user can recover manually
+        try:
+            ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+            REGISTRY.rename(REGISTRY.with_suffix(f".json.broken-{ts}"))
+            sys.stderr.write(
+                f"ccr: registry was corrupt; renamed to .broken-{ts} "
+                "and starting fresh.\n"
+            )
+        except OSError:
+            pass
+        return {}
+
+
+def load_registry() -> dict:
+    with _registry_lock():
+        return _read_registry_unlocked()
+
+
+def save_registry(reg: dict) -> None:
+    CCR_DIR.mkdir(parents=True, exist_ok=True)
+    with _registry_lock():
+        tmp = REGISTRY.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(reg, indent=2))
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(REGISTRY)
+
+
+# ─── Claude session helpers ────────────────────────────────────────────────
+
+def find_session_file(session_id: str) -> Path | None:
+    if not PROJECTS_DIR.exists():
+        return None
+    for proj in PROJECTS_DIR.iterdir():
+        candidate = proj / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def cwd_from_jsonl(path: Path) -> str | None:
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(d, dict) and d.get("cwd"):
+                    return d["cwd"]
+    except OSError:
+        return None
+    return None
+
+
+def first_user_message(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        with path.open() as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(d, dict) and d.get("type") == "user":
+                    content = d.get("message", {}).get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            c.get("text", "")
+                            for c in content
+                            if isinstance(c, dict)
+                        )
+                    return (content or "").strip().replace("\n", " ")[:80]
+    except OSError:
+        pass
+    return ""
+
+
+# ─── Ghostty AppleScript ───────────────────────────────────────────────────
+
+def _osascript(script: str, env_extra: dict | None = None, timeout: float = OSASCRIPT_TIMEOUT) -> str:
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
+    try:
+        out = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return out.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def probe_focused_uuid() -> str | None:
+    """Return the Ghostty surface UUID of the currently-focused terminal.
+
+    Per Ghostty's AppleScript model, `focused terminal` is a property of `tab`
+    — the full path is `focused terminal of selected tab of front window`.
+    """
+    out = _osascript('''
+        tell application "Ghostty"
+            try
+                set t to focused terminal of selected tab of front window
+                return id of t as text
+            on error
+                return ""
+            end try
+        end tell
+    ''')
+    return out if UUID_RE.fullmatch(out) else None
+
+
+def list_ghostty_terminals() -> list[tuple[str, str]]:
+    """Return [(uuid, cwd), ...] for every open Ghostty terminal."""
+    out = _osascript('''
+        tell application "Ghostty"
+            set acc to ""
+            repeat with w in windows
+                try
+                    repeat with t in tabs of w
+                        try
+                            repeat with term in terminals of t
+                                set acc to acc & (id of term as text) & "\t" & (working directory of term as text) & linefeed
+                            end repeat
+                        end try
+                    end repeat
+                end try
+            end repeat
+            return acc
+        end tell
+    ''')
+    rows = []
+    for line in out.splitlines():
+        if "\t" in line:
+            uuid, cwd = line.split("\t", 1)
+            rows.append((uuid.strip(), cwd.strip()))
+    return rows
+
+
+# ─── Auto-prune (lazy delete on tab close) ─────────────────────────────────
+
+def auto_prune_dead_tabs() -> int:
+    """Remove registry entries whose surface UUID is no longer a live Ghostty
+    tab. Tab close = binding delete, lazily on every mutating ccr invocation.
+
+    Safety: only prunes if Ghostty reports at least one live terminal. If
+    AppleScript returns nothing (Ghostty not running, transient error),
+    keep all bindings — never destroy data we might need for crash recovery.
+    """
+    live = {u for u, _ in list_ghostty_terminals()}
+    if not live:
+        return 0
+    with _registry_lock():
+        reg = _read_registry_unlocked()
+        if not reg:
+            return 0
+        pruned = 0
+        for uuid in list(reg.keys()):
+            if uuid not in live:
+                del reg[uuid]
+                pruned += 1
+        if pruned:
+            tmp = REGISTRY.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(reg, indent=2))
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            tmp.replace(REGISTRY)
+        return pruned
+
+
+# ─── Resume primitives ─────────────────────────────────────────────────────
+
+def resume_inplace(session_id: str) -> None:
+    sf = find_session_file(session_id)
+    if sf is None:
+        sys.stderr.write(f"ccr: session {session_id} not found\n")
+        sys.exit(1)
+    cwd = cwd_from_jsonl(sf)
+    if cwd and Path(cwd).exists() and cwd != os.getcwd():
+        os.chdir(cwd)
+    os.execvp("claude", ["claude", "--resume", session_id])
+
+
+# ─── Commands ──────────────────────────────────────────────────────────────
+
+def cmd_default() -> None:
+    """Resume this tab's bound session."""
+    uuid = probe_focused_uuid()
+    if not uuid:
+        sys.stderr.write("ccr: could not determine surface UUID (AppleScript failed)\n")
+        sys.exit(1)
+    reg = load_registry()
+    entry = reg.get(uuid)
+    if not entry:
+        sys.stderr.write(
+            f"ccr: no session bound to this tab ({uuid[:8]}…)\n"
+            f"     try `ccr adopt` to bind the most recent session in cwd,\n"
+            f"     or `ccr pick` to choose interactively.\n"
+        )
+        sys.exit(1)
+    resume_inplace(entry["session_id"])
+
+
+def cmd_ls(scope_to_cwd: bool) -> None:
+    reg = load_registry()
+    rows = []
+    cwd = os.getcwd()
+    for uuid, entry in reg.items():
+        if scope_to_cwd and entry.get("cwd") != cwd:
+            continue
+        sid = entry.get("session_id", "")
+        sf = find_session_file(sid)
+        msg = first_user_message(sf) if sf else "(jsonl missing)"
+        rows.append((entry.get("started_at", ""), uuid[:8], sid[:8], entry.get("cwd", ""), msg))
+    rows.sort(reverse=True)
+    if not rows:
+        scope_msg = "this cwd" if scope_to_cwd else "the registry"
+        sys.stderr.write(f"ccr: no sessions bound in {scope_msg}.\n")
+        return
+    for started, u, s, c, m in rows:
+        print(f"{started}  surface:{u}…  session:{s}…  {c}  {m}")
+
+
+def cmd_pick() -> None:
+    if not shutil.which("fzf"):
+        sys.stderr.write("ccr: fzf not installed (`brew install fzf`). Falling back to ls.\n")
+        cmd_ls(scope_to_cwd=True)
+        return
+    cwd = os.getcwd()
+    encoded = "-" + cwd.lstrip("/").replace("/", "-")
+    proj = PROJECTS_DIR / encoded
+    if not proj.exists():
+        sys.stderr.write(f"ccr: no Claude sessions ever recorded in {cwd}\n")
+        sys.exit(1)
+    items = []
+    for f in sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        items.append(f"{f.stem}\t{first_user_message(f)}")
+    if not items:
+        sys.stderr.write(f"ccr: no sessions in {cwd}\n")
+        sys.exit(1)
+    fzf = subprocess.run(
+        ["fzf", "--with-nth=2..", "--delimiter=\t"],
+        input="\n".join(items),
+        capture_output=True, text=True,
+    )
+    if fzf.returncode != 0 or not fzf.stdout.strip():
+        sys.exit(1)
+    selected_id = fzf.stdout.split("\t", 1)[0].strip()
+    resume_inplace(selected_id)
+
+
+def cmd_adopt() -> None:
+    uuid = probe_focused_uuid()
+    if not uuid:
+        sys.stderr.write("ccr: could not determine surface UUID (AppleScript failed)\n")
+        sys.exit(1)
+    cwd = os.getcwd()
+    encoded = "-" + cwd.lstrip("/").replace("/", "-")
+    proj = PROJECTS_DIR / encoded
+    if not proj.exists():
+        sys.stderr.write(f"ccr: no Claude sessions in {cwd} — nothing to adopt\n")
+        sys.exit(1)
+    most_recent = max(
+        proj.glob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        default=None,
+    )
+    if not most_recent:
+        sys.stderr.write(f"ccr: no .jsonl files in {proj}\n")
+        sys.exit(1)
+    sid = most_recent.stem
+    reg = load_registry()
+    reg[uuid] = {
+        "session_id": sid,
+        "cwd": cwd,
+        "started_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    save_registry(reg)
+    print(f"ccr: bound surface {uuid[:8]}… → session {sid[:8]}…")
+    print(f"     cwd: {cwd}")
+    print(f"     msg: {first_user_message(most_recent)}")
+
+
+def cmd_restore_all() -> None:
+    """Bulk recovery: dispatch `claude --resume <id>` into every restored tab
+    whose UUID is registered, via a SINGLE AppleScript invocation that loops
+    over the targets (avoids 50× osascript spawns)."""
+    reg = load_registry()
+    if not reg:
+        sys.stderr.write("ccr: registry is empty, nothing to restore\n")
+        return
+    live = {u for u, _ in list_ghostty_terminals()}
+    targets = []
+    skipped_dead = 0
+    skipped_missing = 0
+    for uuid, entry in reg.items():
+        if uuid not in live:
+            skipped_dead += 1
+            continue
+        sid = entry["session_id"]
+        if not find_session_file(sid):
+            skipped_missing += 1
+            continue
+        targets.append((uuid, sid, entry.get("cwd", "")))
+
+    if not targets:
+        sys.stderr.write("ccr: no eligible bindings to restore\n")
+        return
+
+    # Build a single AppleScript that loops over targets. Pass UUIDs and
+    # session IDs via env-vars (validated as UUIDs) to avoid injection.
+    script = '''
+        on run
+            set rawList to (system attribute "CCR_TARGETS")
+            set AppleScript's text item delimiters to linefeed
+            set lines to text items of rawList
+            set ok to 0
+            tell application "Ghostty"
+                repeat with ln in lines
+                    if length of ln > 0 then
+                        set AppleScript's text item delimiters to "|"
+                        set parts to text items of ln
+                        set u to item 1 of parts
+                        set s to item 2 of parts
+                        try
+                            set t to terminal id u
+                            input text ("claude --resume " & s) to t
+                            send key "return" to t
+                            set ok to ok + 1
+                        end try
+                    end if
+                end repeat
+            end tell
+            return ok
+        end run
+    '''
+    payload = "\n".join(f"{u}|{s}" for u, s, _ in targets)
+    out = _osascript(script, env_extra={"CCR_TARGETS": payload})
+
+    try:
+        sent = int(out)
+    except ValueError:
+        sent = 0
+
+    for uuid, sid, cwd in targets[:sent]:
+        print(f"  ✓ {uuid[:8]}… → {sid[:8]}…  {cwd}")
+    print()
+    print(f"ccr: dispatched {sent} resume command(s)")
+    if skipped_dead:
+        print(f"     skipped {skipped_dead} (tab no longer exists)")
+    if skipped_missing:
+        print(f"     skipped {skipped_missing} (session JSONL missing)")
+    failed = len(targets) - sent
+    if failed > 0:
+        print(f"     failed {failed} (AppleScript error during dispatch)")
+
+
+def cmd_unbind() -> None:
+    uuid = probe_focused_uuid()
+    if not uuid:
+        sys.stderr.write("ccr: could not determine surface UUID\n")
+        sys.exit(1)
+    reg = load_registry()
+    if uuid in reg:
+        del reg[uuid]
+        save_registry(reg)
+        print(f"ccr: unbound surface {uuid[:8]}…")
+    else:
+        sys.stderr.write("ccr: no binding for this surface\n")
+
+
+def cmd_clear() -> None:
+    reg = load_registry()
+    removed = 0
+    for uuid in list(reg.keys()):
+        sid = reg[uuid].get("session_id", "")
+        if not find_session_file(sid):
+            del reg[uuid]
+            removed += 1
+    save_registry(reg)
+    print(f"ccr: removed {removed} binding(s) whose session JSONL was deleted")
+
+
+def cmd_help() -> None:
+    print((__doc__ or "").strip())
+
+
+def cmd_state() -> None:
+    reg = load_registry()
+    live_pairs = list_ghostty_terminals()
+    live_uuids = {u for u, _ in live_pairs}
+
+    print()
+    print(f"  Registry: {REGISTRY}")
+    print(f"  Bindings: {len(reg)}    Live Ghostty surfaces: {len(live_uuids)}")
+    print()
+
+    if not reg:
+        print("  (registry is empty — start `claude` in a tab to create a binding)")
+        print()
+        return
+
+    rows = []
+    for uuid, entry in reg.items():
+        sid = entry.get("session_id", "")
+        cwd = entry.get("cwd", "")
+        sf = find_session_file(sid)
+        rows.append({
+            "started": entry.get("started_at", ""),
+            "uuid": uuid,
+            "sid": sid,
+            "cwd": cwd,
+            "jsonl_ok": sf is not None,
+            "live": uuid in live_uuids,
+            "msg": first_user_message(sf),
+        })
+    rows.sort(key=lambda r: r["started"], reverse=True)
+
+    print(f"  {'Started (UTC)':<20}  {'Surface UUID':<36}  {'Session UUID':<36}  {'JSONL Tab':<9}  Cwd / first message")
+    print(f"  {'-'*20}  {'-'*36}  {'-'*36}  {'-'*9}  {'-'*40}")
+    for r in rows:
+        jsonl = "✓" if r["jsonl_ok"] else "✗"
+        live = "live" if r["live"] else "dead"
+        status = f"{jsonl}    {live:<4}"
+        print(f"  {r['started']:<20}  {r['uuid']:<36}  {r['sid']:<36}  {status:<9}  {r['cwd']}")
+        if r["msg"]:
+            print(f"  {' '*24}↳ {r['msg']}")
+
+    n_live = sum(1 for r in rows if r["live"])
+    n_dead = sum(1 for r in rows if not r["live"])
+    n_stale = sum(1 for r in rows if not r["jsonl_ok"])
+    n_unbound = len(live_uuids - set(reg.keys()))
+    print()
+    print(f"  Bindings live in current Ghostty: {n_live}")
+    print(f"  Bindings whose tab is gone:       {n_dead}")
+    if n_stale:
+        print(f"  Stale (JSONL deleted):            {n_stale}  (use `ccr clear`)")
+    print(f"  Open Ghostty tabs without bindings: {n_unbound}")
+    print()
+
+
+# ─── Entry point ───────────────────────────────────────────────────────────
+
+# Read-only commands skip auto-prune (they're informational, no need to write)
+READ_ONLY = {"help", "-h", "--help", "ls", "state", "--version", "-v"}
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    cmd = args[0] if args else None
+
+    if cmd in ("--version", "-v"):
+        print(f"ccr {__version__}")
+        return
+    if cmd in ("help", "-h", "--help"):
+        cmd_help()
+        return
+
+    # Lazy delete: tab close = binding delete. Skip for purely read-only.
+    if cmd not in READ_ONLY:
+        auto_prune_dead_tabs()
+
+    if not args:
+        cmd_default(); return
+    if cmd == "ls":
+        cmd_ls(scope_to_cwd=(len(args) > 1 and args[1] == "."))
+        return
+    if cmd == "state":     cmd_state();       return
+    if cmd == "pick":      cmd_pick();        return
+    if cmd == "adopt":     cmd_adopt();       return
+    if cmd == "restore-all": cmd_restore_all(); return
+    if cmd == "unbind":    cmd_unbind();      return
+    if cmd == "clear":     cmd_clear();       return
+    if UUID_RE.fullmatch(cmd):
+        resume_inplace(cmd); return
+    # Prefix match against known sessions
+    if PROJECTS_DIR.exists():
+        matches = []
+        for proj in PROJECTS_DIR.iterdir():
+            for f in proj.glob(f"{cmd}*.jsonl"):
+                matches.append(f.stem)
+        if len(matches) == 1:
+            resume_inplace(matches[0]); return
+        if len(matches) > 1:
+            sys.stderr.write(f"ccr: prefix '{cmd}' matches {len(matches)} sessions; be more specific\n")
+            for m in matches[:10]:
+                sys.stderr.write(f"  {m}\n")
+            sys.exit(1)
+    sys.stderr.write(f"ccr: unknown command or session prefix: {cmd}\n")
+    sys.stderr.write("     try `ccr help` for the full list\n")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
