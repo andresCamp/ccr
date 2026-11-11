@@ -410,10 +410,10 @@ def cmd_restore_all() -> None:
         on run
             set rawList to (system attribute "CCR_TARGETS")
             set AppleScript's text item delimiters to linefeed
-            set lines to text items of rawList
+            set targetLines to text items of rawList
             set ok to 0
             tell application "Ghostty"
-                repeat with ln in lines
+                repeat with ln in targetLines
                     if length of ln > 0 then
                         set AppleScript's text item delimiters to "|"
                         set parts to text items of ln
@@ -422,7 +422,7 @@ def cmd_restore_all() -> None:
                         try
                             set t to terminal id u
                             input text ("claude --resume " & s) to t
-                            send key "return" to t
+                            send key "enter" to t
                             set ok to ok + 1
                         end try
                     end if
